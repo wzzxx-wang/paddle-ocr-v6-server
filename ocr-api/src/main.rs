@@ -245,4 +245,110 @@ fn base64_decode(encoded: &str) -> Result<Vec<u8>, AppError> {
         .map_err(|e| AppError::BadRequest(format!("Base64 decode error: {}", e)))
 }
 
+// ----- Handler functions -----
+
+#[derive(Debug, Clone, Serialize)]
+struct HealthResponse {
+    status: String,
+    version: String,
+    model: String,
+    backend: String,
+    uptime_secs: u64,
+}
+
+async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    let backend = if cfg!(feature = "cuda") {
+        "cuda"
+    } else {
+        "cpu"
+    };
+
+    Json(HealthResponse {
+        status: "ok".to_string(),
+        version: "2.3.1".to_string(),
+        model: "PP-OCRv6_medium".to_string(),
+        backend: backend.to_string(),
+        uptime_secs: state.start_time.elapsed().as_secs(),
+    })
+}
+
+async fn ocr_handler(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+) -> Result<Json<ApiResponse<Vec<OcrItem>>>, AppError> {
+    let _permit = state.semaphore.acquire().await;
+    let start = Instant::now();
+
+    let content_type = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let body = axum::body::to_bytes(req.into_body(), state.max_payload_size)
+        .await
+        .map_err(|_| AppError::PayloadTooLarge)?;
+
+    let img = if content_type.starts_with("multipart/form-data") {
+        let raw = decode_multipart_body(&body, &content_type).await?;
+        decode_image(&raw, state.max_image_size)?
+    } else if content_type.starts_with("application/json") {
+        let mut img = decode_json_body(&body)?;
+        img = resize_if_needed(img, state.max_image_size)?;
+        img
+    } else {
+        return Err(AppError::BadRequest(format!(
+            "Unsupported Content-Type: {}",
+            content_type
+        )));
+    };
+
+    let results = state.engine.recognize(&img)?;
+
+    log::info!(
+        "POST /ocr - 200 OK - {} text regions - {:.3}s",
+        results.len(),
+        start.elapsed().as_secs_f64()
+    );
+
+    let items: Vec<OcrItem> = results.into_iter().map(OcrItem::from).collect();
+    Ok(ApiResponse::ok(items))
+}
+
+async fn ocr_batch_handler(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+) -> Result<Json<ApiResponse<Vec<Vec<OcrItem>>>>, AppError> {
+    let _permit = state.semaphore.acquire().await;
+    let start = Instant::now();
+
+    let body = axum::body::to_bytes(req.into_body(), state.max_payload_size)
+        .await
+        .map_err(|_| AppError::PayloadTooLarge)?;
+
+    let batch: OcrBatchJsonRequest = serde_json::from_slice(&body)
+        .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    let mut all_results: Vec<Vec<OcrItem>> = Vec::with_capacity(batch.images.len());
+
+    for encoded in &batch.images {
+        let raw = base64_decode(encoded)?;
+        let img = decode_image(&raw, state.max_image_size)?;
+        let results = state.engine.recognize(&img)?;
+        all_results.push(results.into_iter().map(OcrItem::from).collect());
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let total_regions: usize = all_results.iter().map(|r| r.len()).sum();
+    log::info!(
+        "POST /ocr/batch - 200 OK - {} images, {} text regions total - {:.3}s",
+        batch.images.len(),
+        total_regions,
+        elapsed,
+    );
+
+    Ok(ApiResponse::ok(all_results))
+}
+
 fn main() {}
