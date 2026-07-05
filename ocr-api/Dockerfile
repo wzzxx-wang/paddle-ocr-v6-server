@@ -2,6 +2,7 @@ FROM rust:1-slim-bookworm AS builder
 WORKDIR /app
 RUN apt-get update && apt-get install -y cmake pkg-config && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml ./
+COPY Cargo.lock ./
 COPY src/ ./src/
 RUN cargo build --release
 

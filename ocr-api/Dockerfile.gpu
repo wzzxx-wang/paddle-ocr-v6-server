@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y cmake pkg-config && rm -rf /var/lib/apt
 
 # Pre-fetch git dep source so cargo can build
 COPY Cargo.toml ./
+COPY Cargo.lock ./
 COPY src/ ./src/
 RUN cargo build --release --features cuda
 

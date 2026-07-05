@@ -323,6 +323,20 @@ async fn ocr_batch_handler(
     let _permit = state.semaphore.acquire().await;
     let start = Instant::now();
 
+    let content_type = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    if !content_type.starts_with("application/json") {
+        return Err(AppError::BadRequest(format!(
+            "Unsupported Content-Type: {}",
+            content_type
+        )));
+    }
+
     let body = axum::body::to_bytes(req.into_body(), state.max_payload_size)
         .await
         .map_err(|_| AppError::PayloadTooLarge)?;
@@ -407,8 +421,33 @@ async fn main() {
         .expect("Failed to bind address");
 
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("Server error");
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 #[cfg(test)]
