@@ -1,12 +1,14 @@
 use axum::{
-    extract::{Multipart, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
-use image::{DynamicImage, ImageFormat};
-use ocr_rs::{Backend, OcrEngine, OcrEngineConfig, OcrResult_};
+use bytes::Bytes;
+use image::DynamicImage;
+use multer::Multipart;
+use ocr_rs::{OcrEngine, OcrEngineConfig, OcrResult_};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
@@ -176,6 +178,71 @@ fn resize_if_needed(img: DynamicImage, max_size: u32) -> Result<DynamicImage, Ap
     let new_w = (w as f64 * ratio) as u32;
     let new_h = (h as f64 * ratio) as u32;
     Ok(img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3))
+}
+
+// ----- Multipart decode helper -----
+
+/// Parse a multipart form body to extract the "file" field as raw bytes.
+/// Returns Err(BadRequest) if no file field is found.
+async fn decode_multipart_body(
+    body: &[u8],
+    content_type: &str,
+) -> Result<Vec<u8>, AppError> {
+    // Extract boundary from Content-Type header
+    let boundary = content_type
+        .split("boundary=")
+        .nth(1)
+        .and_then(|s| {
+            let s = s.trim();
+            // strip optional quotes
+            Some(s.trim_matches('"').to_string())
+        })
+        .ok_or_else(|| AppError::BadRequest("Missing multipart boundary".to_string()))?;
+
+    use std::convert::Infallible;
+    let stream = tokio_stream::once(Ok::<Bytes, Infallible>(Bytes::copy_from_slice(body)));
+    let mut multipart = Multipart::new(stream, boundary);
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Multipart parse error: {}", e)))?
+    {
+        if field.name() == Some("file") {
+            let data = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::BadRequest(format!("File field read error: {}", e)))?;
+            return Ok(data.to_vec());
+        }
+    }
+
+    Err(AppError::BadRequest(
+        "No 'file' field found in multipart form".to_string(),
+    ))
+}
+
+// ----- JSON base64 decode helpers -----
+
+/// Parse JSON body to extract base64-encoded image
+fn decode_json_body(body: &[u8]) -> Result<DynamicImage, AppError> {
+    let req: OcrJsonRequest =
+        serde_json::from_slice(body).map_err(|e| AppError::BadRequest(format!("Invalid JSON: {}", e)))?;
+    let bytes = base64_decode(&req.image)?;
+    decode_image(&bytes, u32::MAX) // caller will resize
+}
+
+fn base64_decode(encoded: &str) -> Result<Vec<u8>, AppError> {
+    // Strip optional data URI prefix: "data:image/png;base64,..."
+    let stripped = if let Some(pos) = encoded.find("base64,") {
+        &encoded[pos + 7..]
+    } else {
+        encoded
+    };
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(stripped)
+        .map_err(|e| AppError::BadRequest(format!("Base64 decode error: {}", e)))
 }
 
 fn main() {}

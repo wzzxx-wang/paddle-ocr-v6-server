@@ -20,4 +20,6 @@ log = "0.4"
 thiserror = "1"
 base64 = "0.22"
 multer = "3"
+bytes = "1"
+tokio-stream = "0.1"
 uuid = { version = "1", features = ["v4"] }
