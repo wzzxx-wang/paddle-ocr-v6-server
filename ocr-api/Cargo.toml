@@ -10,7 +10,7 @@ cuda = ["ocr-rs/cuda"]
 
 [dependencies]
 ocr-rs = { git = "https://github.com/zibo-chen/rust-paddle-ocr.git", tag = "v2.3.1", features = ["build-mnn-from-source"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
