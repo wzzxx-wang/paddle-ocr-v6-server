@@ -1,0 +1,23 @@
+[package]
+name = "ocr-api"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = ["ocr-rs/cuda"]
+
+[dependencies]
+ocr-rs = { git = "https://github.com/zibo-chen/rust-paddle-ocr.git", tag = "v2.3.1", features = ["build-mnn-from-source"] }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = "0.25"
+env_logger = "0.11"
+log = "0.4"
+thiserror = "1"
+base64 = "0.22"
+multer = "3"
+uuid = { version = "1", features = ["v4"] }
