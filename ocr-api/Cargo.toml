@@ -23,3 +23,6 @@ multer = "3"
 bytes = "1"
 tokio-stream = "0.1"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+imageproc = "0.25"

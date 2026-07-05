@@ -1,2 +1,5 @@
 /target
 models/
+
+# Review artifacts
+.superpowers/sdd/*.diff

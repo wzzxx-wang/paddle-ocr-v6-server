@@ -410,3 +410,78 @@ async fn main() {
         .await
         .expect("Server error");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resize_if_needed_within_limit() {
+        let img = DynamicImage::new_rgb8(800, 600);
+        let result = resize_if_needed(img, 4096).unwrap();
+        assert_eq!(result.width(), 800);
+        assert_eq!(result.height(), 600);
+    }
+
+    #[test]
+    fn test_resize_if_needed_exceeds_limit() {
+        let img = DynamicImage::new_rgb8(8000, 6000);
+        let result = resize_if_needed(img, 4096).unwrap();
+        assert!(result.width() <= 4096);
+        assert!(result.height() <= 4096);
+        // Aspect ratio should be preserved (8000:6000 = 4:3)
+        assert!((result.width() as f64 / result.height() as f64 - 4.0 / 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_ocr_item_from_result_round_trip() {
+        let bbox = ocr_rs::TextBox::new(
+            imageproc::rect::Rect::at(10, 20).of_size(200, 30),
+            0.9,
+        );
+        let result = OcrResult_::new("hello".into(), 0.95, bbox);
+        let item: OcrItem = result.into();
+        assert_eq!(item.text, "hello");
+        assert!((item.confidence - 0.95).abs() < 0.001);
+        assert_eq!(item.bbox.left, 10);
+        assert_eq!(item.bbox.top, 20);
+        assert_eq!(item.bbox.width, 200);
+        assert_eq!(item.bbox.height, 30);
+    }
+
+    #[test]
+    fn test_base64_decode_round_trip() {
+        let original = b"hello world";
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(original);
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_base64_decode_with_data_uri() {
+        let encoded = "data:image/png;base64,aGVsbG8=";
+        let decoded = base64_decode(encoded).unwrap();
+        assert_eq!(decoded, b"hello");
+    }
+
+    #[test]
+    fn test_base64_decode_invalid() {
+        let result = base64_decode("!!!not-valid-base64!!!");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_app_error_bad_request_response() {
+        let err = AppError::BadRequest("test error".into());
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_app_error_payload_too_large_response() {
+        let err = AppError::PayloadTooLarge;
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}
