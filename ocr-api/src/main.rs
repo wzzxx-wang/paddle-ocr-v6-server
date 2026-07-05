@@ -8,7 +8,7 @@ use axum::{
 use bytes::Bytes;
 use image::DynamicImage;
 use multer::Multipart;
-use ocr_rs::{OcrEngine, OcrEngineConfig, OcrResult_};
+use ocr_rs::{Backend, OcrEngine, OcrEngineConfig, OcrResult_};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
@@ -351,4 +351,62 @@ async fn ocr_batch_handler(
     Ok(ApiResponse::ok(all_results))
 }
 
-fn main() {}
+#[tokio::main]
+async fn main() {
+    env_logger::init();
+
+    log::info!("Loading configuration...");
+    let config = AppConfig::from_env();
+
+    // Determine backend at compile time
+    #[cfg(feature = "cuda")]
+    let backend = Backend::CUDA;
+    #[cfg(not(feature = "cuda"))]
+    let backend = Backend::CPU;
+
+    log::info!(
+        "Initializing OCR engine (backend: {:?}, threads: {})...",
+        backend,
+        config.threads,
+    );
+
+    let engine_config = OcrEngineConfig::new()
+        .with_backend(backend)
+        .with_threads(config.threads)
+        .with_min_result_confidence(config.confidence);
+
+    let engine = OcrEngine::new(
+        &config.det_model,
+        &config.rec_model,
+        &config.charset,
+        Some(engine_config),
+    )
+    .expect("Failed to initialize OCR engine — check model files");
+
+    log::info!("OCR engine ready. Starting server...");
+
+    let state = Arc::new(AppState {
+        engine: Arc::new(engine),
+        semaphore: Semaphore::new(config.concurrency),
+        start_time: Instant::now(),
+        max_image_size: config.max_image_size,
+        max_payload_size: config.max_payload_size,
+    });
+
+    let app = Router::new()
+        .route("/ocr", post(ocr_handler))
+        .route("/ocr/batch", post(ocr_batch_handler))
+        .route("/health", get(health_handler))
+        .with_state(state);
+
+    let addr = format!("{}:{}", config.host, config.port);
+    log::info!("Listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("Failed to bind address");
+
+    axum::serve(listener, app)
+        .await
+        .expect("Server error");
+}
