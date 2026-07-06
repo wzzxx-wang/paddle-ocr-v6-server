@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
     routing::{get, post},
@@ -8,8 +8,9 @@ use axum::{
 use bytes::Bytes;
 use image::DynamicImage;
 use multer::Multipart;
-use ocr_rs::{Backend, OcrEngine, OcrEngineConfig, OcrResult_};
+use ocr_rs::{Backend, OcrEngine, OcrEngineConfig, OcrResult_, TextBox, RecognitionResult};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
@@ -20,12 +21,10 @@ use tokio::sync::Semaphore;
 struct AppConfig {
     host: String,
     port: u16,
-    det_model: String,
-    rec_model: String,
-    charset: String,
     threads: i32,
     concurrency: usize,
     confidence: f32,
+    infer_concurrency: usize,
     max_image_size: u32,
     max_payload_size: usize,
 }
@@ -44,22 +43,102 @@ impl AppConfig {
         Self {
             host: env_or("OCR_HOST", "0.0.0.0"),
             port: env_or_parse("OCR_PORT", "8080"),
-            det_model: env_or("OCR_DET_MODEL", "models/PP-OCRv6_medium_det.mnn"),
-            rec_model: env_or("OCR_REC_MODEL", "models/PP-OCRv6_medium_rec.mnn"),
-            charset: env_or("OCR_CHARSET", "models/ppocr_keys_v6_medium.txt"),
             threads: env_or_parse("OCR_THREADS", "4"),
             concurrency: env_or_parse("OCR_CONCURRENCY", "10"),
             confidence: env_or_parse("OCR_CONFIDENCE", "0.5"),
+            infer_concurrency: env_or_parse("OCR_INFER_CONCURRENCY", "2"),
             max_image_size: env_or_parse("OCR_MAX_IMAGE_SIZE", "4096"),
             max_payload_size: env_or_parse("OCR_MAX_PAYLOAD_SIZE", "20971520"),
         }
     }
 }
 
+/// Model variants available for runtime switching
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ModelVariant {
+    Medium,
+    Small,
+    Tiny,
+}
+
+impl ModelVariant {
+    fn all() -> [(&'static str, ModelVariant); 3] {
+        [
+            ("medium", ModelVariant::Medium),
+            ("small", ModelVariant::Small),
+            ("tiny", ModelVariant::Tiny),
+        ]
+    }
+
+    fn det_path(self) -> &'static str {
+        match self {
+            ModelVariant::Medium => "models/PP-OCRv6_medium_det.mnn",
+            ModelVariant::Small => "models/PP-OCRv6_small_det.mnn",
+            ModelVariant::Tiny => "models/PP-OCRv6_tiny_det.mnn",
+        }
+    }
+
+    fn rec_path(self) -> &'static str {
+        match self {
+            ModelVariant::Medium => "models/PP-OCRv6_medium_rec.mnn",
+            ModelVariant::Small => "models/PP-OCRv6_small_rec.mnn",
+            ModelVariant::Tiny => "models/PP-OCRv6_tiny_rec.mnn",
+        }
+    }
+
+    fn charset_path(self) -> &'static str {
+        match self {
+            ModelVariant::Medium => "models/ppocr_keys_v6_medium.txt",
+            ModelVariant::Small => "models/ppocr_keys_v6_small.txt",
+            ModelVariant::Tiny => "models/ppocr_keys_v6_tiny.txt",
+        }
+    }
+
+}
+
+/// Pre-loaded engines for all model variants
+struct ModelSet {
+    engines: HashMap<String, Arc<OcrEngine>>,
+}
+
+impl ModelSet {
+    fn load(config: &AppConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(feature = "cuda")]
+        let backend = Backend::CUDA;
+        #[cfg(not(feature = "cuda"))]
+        let backend = Backend::CPU;
+
+        let mut engines = HashMap::new();
+        for (name, variant) in ModelVariant::all() {
+            log::info!("Loading {name} model...");
+            let engine = OcrEngine::new(
+                variant.det_path(),
+                variant.rec_path(),
+                variant.charset_path(),
+                Some(
+                    OcrEngineConfig::new()
+                        .with_backend(backend)
+                        .with_threads(config.threads)
+                        .with_min_result_confidence(config.confidence),
+                ),
+            )?;
+            engines.insert(name.to_string(), Arc::new(engine));
+        }
+
+        Ok(ModelSet { engines })
+    }
+
+    fn get(&self, name: &str) -> Option<Arc<OcrEngine>> {
+        self.engines.get(name).cloned()
+    }
+}
+
 /// Shared application state
 struct AppState {
-    engine: Arc<OcrEngine>,
+    models: ModelSet,
     semaphore: Semaphore,
+    infer_semaphore: Arc<tokio::sync::Semaphore>,
+    min_confidence: f32,
     start_time: Instant,
     max_image_size: u32,
     max_payload_size: usize,
@@ -154,11 +233,18 @@ impl<T: Serialize> ApiResponse<T> {
 #[derive(Debug, Deserialize)]
 struct OcrJsonRequest {
     image: String,
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OcrBatchJsonRequest {
     images: Vec<String>,
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OcrQueryParams {
+    model: Option<String>,
 }
 
 // ----- Image helpers -----
@@ -222,14 +308,83 @@ async fn decode_multipart_body(
     ))
 }
 
+/// Run detection then concurrently recognize each text line.
+/// Results sorted top-to-bottom, left-to-right, filtered by recognition confidence.
+async fn recognize_text_lines(
+    engine: Arc<OcrEngine>,
+    img: DynamicImage,
+    state: &AppState,
+) -> Result<Vec<OcrItem>, AppError> {
+    // Step 1: Detect text regions (CPU-bound via spawn_blocking)
+    let det_engine = engine.clone();
+    let img_for_det = img.clone();
+    let text_boxes: Vec<TextBox> = tokio::task::spawn_blocking(move || {
+        det_engine.detect(&img_for_det)
+    })
+    .await
+    .map_err(|e| AppError::BadRequest(format!("Detection join error: {}", e)))?
+    .map_err(AppError::OcrError)?;
+
+    if text_boxes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Step 2: Crop each text region and spawn concurrent recognition tasks
+    let mut handles = Vec::with_capacity(text_boxes.len());
+
+    for tb in text_boxes {
+        let e = engine.clone();
+        let rect = tb.rect;
+        let crop = img.crop_imm(rect.left().max(0) as u32, rect.top().max(0) as u32, rect.width() as u32, rect.height() as u32);
+        // Acquire permit before spawning (async context) — gates concurrency
+        let permit = state.infer_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("infer semaphore closed");
+
+        handles.push(tokio::task::spawn_blocking(move || {
+            let _permit = permit; // held for duration of recognize
+            let rec = e.recognize_text(&crop)?;
+            Ok::<(TextBox, RecognitionResult), AppError>((tb, rec))
+        }));
+    }
+
+    // Step 3: Collect results, filter by confidence, format into OcrItem
+    let mut items: Vec<OcrItem> = Vec::with_capacity(handles.len());
+    for handle in handles {
+        let (tb, rec) = handle
+            .await
+            .map_err(|e| AppError::BadRequest(format!("Recognize join error: {}", e)))??;
+
+        if rec.confidence < state.min_confidence {
+            continue;
+        }
+
+        items.push(OcrItem {
+            text: rec.text,
+            confidence: rec.confidence,
+            bbox: Bbox {
+                left: tb.rect.left(),
+                top: tb.rect.top(),
+                width: tb.rect.width() as u32,
+                height: tb.rect.height() as u32,
+            },
+        });
+    }
+
+    // Step 4: Sort top-to-bottom, left-to-right
+    items.sort_by_key(|item| (item.bbox.top, item.bbox.left));
+
+    Ok(items)
+}
+
 // ----- JSON base64 decode helpers -----
 
-/// Parse JSON body to extract base64-encoded image
-fn decode_json_body(body: &[u8]) -> Result<DynamicImage, AppError> {
-    let req: OcrJsonRequest =
-        serde_json::from_slice(body).map_err(|e| AppError::BadRequest(format!("Invalid JSON: {}", e)))?;
-    let bytes = base64_decode(&req.image)?;
-    decode_image(&bytes, u32::MAX) // caller will resize
+/// Parse JSON body to extract base64-encoded image and optional model variant
+fn decode_json_body(body: &[u8]) -> Result<OcrJsonRequest, AppError> {
+    serde_json::from_slice::<OcrJsonRequest>(body)
+        .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {}", e)))
 }
 
 fn base64_decode(encoded: &str) -> Result<Vec<u8>, AppError> {
@@ -274,6 +429,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthRespon
 
 async fn ocr_handler(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<OcrQueryParams>,
     req: axum::http::Request<axum::body::Body>,
 ) -> Result<Json<ApiResponse<Vec<OcrItem>>>, AppError> {
     let _permit = state.semaphore.acquire().await;
@@ -290,13 +446,20 @@ async fn ocr_handler(
         .await
         .map_err(|_| AppError::PayloadTooLarge)?;
 
-    let img = if content_type.starts_with("multipart/form-data") {
+    // Determine model variant: query param -> JSON field -> default "medium"
+    let (img, model_name) = if content_type.starts_with("multipart/form-data") {
         let raw = decode_multipart_body(&body, &content_type).await?;
-        decode_image(&raw, state.max_image_size)?
+        let img = decode_image(&raw, state.max_image_size)?;
+        let model_name = params.model.clone().unwrap_or_else(|| "medium".to_string());
+        (img, model_name)
     } else if content_type.starts_with("application/json") {
-        let mut img = decode_json_body(&body)?;
-        img = resize_if_needed(img, state.max_image_size)?;
-        img
+        let req = decode_json_body(&body)?;
+        let bytes = base64_decode(&req.image)?;
+        let img = decode_image(&bytes, state.max_image_size)?;
+        let model_name = req.model
+            .or_else(|| params.model.clone())
+            .unwrap_or_else(|| "medium".to_string());
+        (img, model_name)
     } else {
         return Err(AppError::BadRequest(format!(
             "Unsupported Content-Type: {}",
@@ -304,20 +467,28 @@ async fn ocr_handler(
         )));
     };
 
-    let results = state.engine.recognize(&img)?;
+    let engine = state.models.get(&model_name).ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "Unknown model variant: {}. Supported: medium, small, tiny",
+            model_name
+        ))
+    })?;
+
+    let items = recognize_text_lines(engine, img, &state).await?;
 
     log::info!(
-        "POST /ocr - 200 OK - {} text regions - {:.3}s",
-        results.len(),
+        "POST /ocr - 200 OK - {} text regions - model: {} - {:.3}s",
+        items.len(),
+        model_name,
         start.elapsed().as_secs_f64()
     );
 
-    let items: Vec<OcrItem> = results.into_iter().map(OcrItem::from).collect();
     Ok(ApiResponse::ok(items))
 }
 
 async fn ocr_batch_handler(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<OcrQueryParams>,
     req: axum::http::Request<axum::body::Body>,
 ) -> Result<Json<ApiResponse<Vec<Vec<OcrItem>>>>, AppError> {
     let _permit = state.semaphore.acquire().await;
@@ -344,21 +515,52 @@ async fn ocr_batch_handler(
     let batch: OcrBatchJsonRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {}", e)))?;
 
-    let mut all_results: Vec<Vec<OcrItem>> = Vec::with_capacity(batch.images.len());
+    let model_name = batch.model
+        .or_else(|| params.model.clone())
+        .unwrap_or_else(|| "medium".to_string());
 
-    for encoded in &batch.images {
-        let raw = base64_decode(encoded)?;
-        let img = decode_image(&raw, state.max_image_size)?;
-        let results = state.engine.recognize(&img)?;
-        all_results.push(results.into_iter().map(OcrItem::from).collect());
+    let engine = state.models.get(&model_name).ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "Unknown model variant: {}. Supported: medium, small, tiny",
+            model_name
+        ))
+    })?;
+
+    // Decode all images first
+    let decoded = batch
+        .images
+        .iter()
+        .map(|encoded| {
+            let raw = base64_decode(encoded)?;
+            decode_image(&raw, state.max_image_size)
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+
+    // Process all images concurrently (each uses spawn_blocking internally)
+    let mut handles = Vec::with_capacity(decoded.len());
+    for img in decoded {
+        let e = engine.clone();
+        let state_clone = state.clone();
+        handles.push(tokio::spawn(async move {
+            recognize_text_lines(e, img, &state_clone).await
+        }));
+    }
+
+    let mut all_results: Vec<Vec<OcrItem>> = Vec::with_capacity(handles.len());
+    for handle in handles {
+        let items = handle
+            .await
+            .map_err(|e| AppError::BadRequest(format!("Task join error: {}", e)))??;
+        all_results.push(items);
     }
 
     let elapsed = start.elapsed().as_secs_f64();
     let total_regions: usize = all_results.iter().map(|r| r.len()).sum();
     log::info!(
-        "POST /ocr/batch - 200 OK - {} images, {} text regions total - {:.3}s",
+        "POST /ocr/batch - 200 OK - {} images, {} text regions total - model: {} - {:.3}s",
         batch.images.len(),
         total_regions,
+        model_name,
         elapsed,
     );
 
@@ -372,36 +574,22 @@ async fn main() {
     log::info!("Loading configuration...");
     let config = AppConfig::from_env();
 
-    // Determine backend at compile time
-    #[cfg(feature = "cuda")]
-    let backend = Backend::CUDA;
-    #[cfg(not(feature = "cuda"))]
-    let backend = Backend::CPU;
-
     log::info!(
-        "Initializing OCR engine (backend: {:?}, threads: {})...",
-        backend,
+        "Loading all model variants (medium, small, tiny) with backend: {}, threads: {}...",
+        if cfg!(feature = "cuda") { "cuda" } else { "cpu" },
         config.threads,
     );
 
-    let engine_config = OcrEngineConfig::new()
-        .with_backend(backend)
-        .with_threads(config.threads)
-        .with_min_result_confidence(config.confidence);
+    let models = ModelSet::load(&config)
+        .expect("Failed to initialize OCR engines — check model files");
 
-    let engine = OcrEngine::new(
-        &config.det_model,
-        &config.rec_model,
-        &config.charset,
-        Some(engine_config),
-    )
-    .expect("Failed to initialize OCR engine — check model files");
-
-    log::info!("OCR engine ready. Starting server...");
+    log::info!("All models loaded. Starting server...");
 
     let state = Arc::new(AppState {
-        engine: Arc::new(engine),
+        models,
         semaphore: Semaphore::new(config.concurrency),
+        infer_semaphore: Arc::new(tokio::sync::Semaphore::new(config.infer_concurrency)),
+        min_confidence: config.confidence,
         start_time: Instant::now(),
         max_image_size: config.max_image_size,
         max_payload_size: config.max_payload_size,
@@ -522,5 +710,25 @@ mod tests {
         let err = AppError::PayloadTooLarge;
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn test_text_box_sorting() {
+        use ocr_rs::TextBox;
+        use imageproc::rect::Rect;
+
+        let tb1 = TextBox::new(Rect::at(5, 30).of_size(100, 20), 0.9);
+        let tb2 = TextBox::new(Rect::at(10, 10).of_size(80, 20), 0.9);
+        let tb3 = TextBox::new(Rect::at(0, 20).of_size(60, 15), 0.9);
+
+        let mut boxes = vec![tb1, tb2, tb3];
+        // Sort top-to-bottom, left-to-right
+        boxes.sort_by_key(|b| (b.rect.top(), b.rect.left()));
+
+        assert_eq!(boxes[0].rect.top(), 10);
+        assert_eq!(boxes[1].rect.top(), 20);
+        assert_eq!(boxes[2].rect.top(), 30);
+        // Within same top row, left takes priority
+        assert_eq!(boxes[1].rect.left(), 0);
     }
 }
