@@ -22,6 +22,9 @@ base64 = "0.22"
 multer = "3"
 bytes = "1"
 tokio-stream = "0.1"
+futures = "0.3"
+lru = "0.12"
+dotenvy = "0.15"
 
 [dev-dependencies]
 imageproc = "0.25"

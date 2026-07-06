@@ -10,8 +10,12 @@ use image::DynamicImage;
 use multer::Multipart;
 use ocr_rs::{Backend, OcrEngine, OcrEngineConfig, OcrResult_, TextBox, RecognitionResult};
 use serde::{Deserialize, Serialize};
+use lru::LruCache;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -25,6 +29,7 @@ struct AppConfig {
     concurrency: usize,
     confidence: f32,
     infer_concurrency: usize,
+    cache_max_mb: usize,
     max_image_size: u32,
     max_payload_size: usize,
 }
@@ -47,6 +52,7 @@ impl AppConfig {
             concurrency: env_or_parse("OCR_CONCURRENCY", "10"),
             confidence: env_or_parse("OCR_CONFIDENCE", "0.5"),
             infer_concurrency: env_or_parse("OCR_INFER_CONCURRENCY", "2"),
+            cache_max_mb: env_or_parse("OCR_CACHE_MAX_MB", "500"),
             max_image_size: env_or_parse("OCR_MAX_IMAGE_SIZE", "4096"),
             max_payload_size: env_or_parse("OCR_MAX_PAYLOAD_SIZE", "20971520"),
         }
@@ -139,6 +145,7 @@ struct AppState {
     semaphore: Semaphore,
     infer_semaphore: Arc<tokio::sync::Semaphore>,
     min_confidence: f32,
+    cache: OcrCache,
     start_time: Instant,
     max_image_size: u32,
     max_payload_size: usize,
@@ -264,6 +271,68 @@ fn resize_if_needed(img: DynamicImage, max_size: u32) -> Result<DynamicImage, Ap
     let new_w = (w as f64 * ratio) as u32;
     let new_h = (h as f64 * ratio) as u32;
     Ok(img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3))
+}
+
+// ----- LRU Cache for OCR results -----
+
+/// Approximate byte size of a Vec<OcrItem> (used for cache eviction accounting).
+fn estimate_items_size(items: &[OcrItem]) -> usize {
+    items.len() * std::mem::size_of::<OcrItem>()
+        + items.iter().map(|i| i.text.capacity()).sum::<usize>()
+}
+
+/// Compute a cache key from raw image bytes + model name.
+fn hash_raw(bytes: &[u8], model: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    model.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Size-aware LRU cache. Evicts oldest entries when total exceeds max_bytes.
+struct OcrCache {
+    inner: Mutex<OcrCacheInner>,
+    max_bytes: usize,
+}
+
+struct OcrCacheInner {
+    lru: LruCache<u64, Vec<OcrItem>>,
+    current_bytes: usize,
+}
+
+impl OcrCache {
+    fn new(max_bytes: usize) -> Self {
+        // LruCache entry-count cap — set high so byte-size eviction governs instead.
+        let count_cap = NonZeroUsize::new(1_000_000).expect("1M is non-zero");
+        Self {
+            inner: Mutex::new(OcrCacheInner {
+                lru: LruCache::new(count_cap),
+                current_bytes: 0,
+            }),
+            max_bytes,
+        }
+    }
+
+    fn get(&self, key: &u64) -> Option<Vec<OcrItem>> {
+        let mut inner = self.inner.lock().expect("cache lock poisoned");
+        inner.lru.get(key).cloned()
+    }
+
+    fn put(&self, key: u64, items: Vec<OcrItem>) {
+        let entry_size = estimate_items_size(&items);
+        let mut inner = self.inner.lock().expect("cache lock poisoned");
+
+        // Evict oldest entries until there's room (or cache is empty).
+        while inner.current_bytes + entry_size > self.max_bytes && inner.lru.len() > 0 {
+            if let Some((_, evicted)) = inner.lru.pop_lru() {
+                inner.current_bytes =
+                    inner.current_bytes.saturating_sub(estimate_items_size(&evicted));
+            }
+        }
+
+        inner.lru.put(key, items);
+        inner.current_bytes += entry_size;
+    }
 }
 
 // ----- Multipart decode helper -----
@@ -447,25 +516,37 @@ async fn ocr_handler(
         .map_err(|_| AppError::PayloadTooLarge)?;
 
     // Determine model variant: query param -> JSON field -> default "medium"
-    let (img, model_name) = if content_type.starts_with("multipart/form-data") {
+    let (raw_bytes, model_name) = if content_type.starts_with("multipart/form-data") {
         let raw = decode_multipart_body(&body, &content_type).await?;
-        let img = decode_image(&raw, state.max_image_size)?;
         let model_name = params.model.clone().unwrap_or_else(|| "medium".to_string());
-        (img, model_name)
+        (raw, model_name)
     } else if content_type.starts_with("application/json") {
         let req = decode_json_body(&body)?;
         let bytes = base64_decode(&req.image)?;
-        let img = decode_image(&bytes, state.max_image_size)?;
         let model_name = req.model
             .or_else(|| params.model.clone())
             .unwrap_or_else(|| "medium".to_string());
-        (img, model_name)
+        (bytes, model_name)
     } else {
         return Err(AppError::BadRequest(format!(
             "Unsupported Content-Type: {}",
             content_type
         )));
     };
+
+    // Check cache before OCR
+    let cache_key = hash_raw(&raw_bytes, &model_name);
+    if let Some(cached) = state.cache.get(&cache_key) {
+        log::info!(
+            "POST /ocr - 200 OK - {} text regions (cached) - model: {} - {:.3}s",
+            cached.len(),
+            model_name,
+            start.elapsed().as_secs_f64()
+        );
+        return Ok(ApiResponse::ok(cached));
+    }
+
+    let img = decode_image(&raw_bytes, state.max_image_size)?;
 
     let engine = state.models.get(&model_name).ok_or_else(|| {
         AppError::BadRequest(format!(
@@ -475,6 +556,9 @@ async fn ocr_handler(
     })?;
 
     let items = recognize_text_lines(engine, img, &state).await?;
+
+    // Store in cache (clone for logging, original moves into cache)
+    state.cache.put(cache_key, items.clone());
 
     log::info!(
         "POST /ocr - 200 OK - {} text regions - model: {} - {:.3}s",
@@ -526,33 +610,55 @@ async fn ocr_batch_handler(
         ))
     })?;
 
-    // Decode all images first
-    let decoded = batch
+    // Decode all base64 images to raw bytes (needed for cache key)
+    let raw_images: Vec<Vec<u8>> = batch
         .images
         .iter()
-        .map(|encoded| {
-            let raw = base64_decode(encoded)?;
-            decode_image(&raw, state.max_image_size)
-        })
+        .map(|encoded| base64_decode(encoded))
         .collect::<Result<Vec<_>, AppError>>()?;
 
-    // Process all images concurrently (each uses spawn_blocking internally)
+    // Check cache for each image; only process uncached ones
+    let mut all_results: Vec<Option<Vec<OcrItem>>> = vec![None; raw_images.len()];
+    let mut to_process: Vec<(usize, Vec<u8>)> = Vec::new();
+
+    for (i, raw) in raw_images.iter().enumerate() {
+        let cache_key = hash_raw(raw, &model_name);
+        if let Some(cached) = state.cache.get(&cache_key) {
+            all_results[i] = Some(cached);
+        } else {
+            to_process.push((i, raw.clone()));
+        }
+    }
+
+    // Decode only uncached images
+    let decoded: Vec<DynamicImage> = to_process
+        .iter()
+        .map(|(_, raw)| decode_image(raw, state.max_image_size))
+        .collect::<Result<Vec<_>, AppError>>()?;
+
+    // Process uncached images concurrently
     let mut handles = Vec::with_capacity(decoded.len());
-    for img in decoded {
+    for (idx, img) in decoded.into_iter().enumerate() {
         let e = engine.clone();
         let state_clone = state.clone();
         handles.push(tokio::spawn(async move {
-            recognize_text_lines(e, img, &state_clone).await
+            let items = recognize_text_lines(e, img, &state_clone).await?;
+            Ok::<(usize, Vec<OcrItem>), AppError>((idx, items))
         }));
     }
 
-    let mut all_results: Vec<Vec<OcrItem>> = Vec::with_capacity(handles.len());
+    // Collect fresh results and store in cache
     for handle in handles {
-        let items = handle
+        let (idx_in_to_process, items) = handle
             .await
             .map_err(|e| AppError::BadRequest(format!("Task join error: {}", e)))??;
-        all_results.push(items);
+        let (orig_idx, raw) = &to_process[idx_in_to_process];
+        state.cache.put(hash_raw(raw, &model_name), items.clone());
+        all_results[*orig_idx] = Some(items);
     }
+
+    // All results are now populated
+    let all_results: Vec<Vec<OcrItem>> = all_results.into_iter().map(|r| r.unwrap()).collect();
 
     let elapsed = start.elapsed().as_secs_f64();
     let total_regions: usize = all_results.iter().map(|r| r.len()).sum();
@@ -570,6 +676,8 @@ async fn ocr_batch_handler(
 #[tokio::main]
 async fn main() {
     env_logger::init();
+
+    dotenvy::dotenv().ok();
 
     log::info!("Loading configuration...");
     let config = AppConfig::from_env();
@@ -590,6 +698,7 @@ async fn main() {
         semaphore: Semaphore::new(config.concurrency),
         infer_semaphore: Arc::new(tokio::sync::Semaphore::new(config.infer_concurrency)),
         min_confidence: config.confidence,
+        cache: OcrCache::new(config.cache_max_mb * 1024 * 1024),
         start_time: Instant::now(),
         max_image_size: config.max_image_size,
         max_payload_size: config.max_payload_size,
