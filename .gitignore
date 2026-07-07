@@ -1,0 +1,39 @@
+# Rust build
+ocr-api/target/
+
+# OCR model files (downloaded via download-models.sh)
+ocr-api/models/
+
+# Vendored MNN (build cache, ~350MB, not for git)
+ocr-api/ocr-rs-MNN/
+
+# Environment
+ocr-api/.env
+ocr-api/.env.local
+
+# Development artifacts
+ocr-api/test-image.png
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Internal planning docs
+docs/superpowers/
+
+# Internal dev docs (build troubleshooting, etc.)
+ocr-api/docs/
+
+# Deployment artifacts (tar.gz, etc.)
+ocr-api/deploy/
+
+# CLAUDE.md is internal
+ocr-api/CLAUDE.md
+
+# Logs
+*.log

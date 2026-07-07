@@ -322,6 +322,10 @@ impl OcrCache {
         let entry_size = estimate_items_size(&items);
         let mut inner = self.inner.lock().expect("cache lock poisoned");
 
+        // If key already exists, remove its size from accounting first.
+        let old_size = inner.lru.peek(&key).map(|v| estimate_items_size(v)).unwrap_or(0);
+        inner.current_bytes = inner.current_bytes.saturating_sub(old_size);
+
         // Evict oldest entries until there's room (or cache is empty).
         while inner.current_bytes + entry_size > self.max_bytes && inner.lru.len() > 0 {
             if let Some((_, evicted)) = inner.lru.pop_lru() {

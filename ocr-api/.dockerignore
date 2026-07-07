@@ -1,0 +1,10 @@
+.git/
+.gitignore
+target/
+*.md
+docs/
+deploy/
+test-image.png
+.env
+.env.local
+Dockerfile*

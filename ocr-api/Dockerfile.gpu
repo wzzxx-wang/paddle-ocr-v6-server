@@ -1,17 +1,37 @@
-FROM nvidia/cuda:12.4-devel-bookworm AS builder
+FROM nvidia/cuda:12.4.0-devel-ubuntu22.04 AS builder
 WORKDIR /app
 
-# Install build deps
-RUN apt-get update && apt-get install -y cmake pkg-config && rm -rf /var/lib/apt/lists/*
+# Install build deps + cuDNN
+RUN apt-get update && apt-get install -y cmake pkg-config git build-essential libclang-dev ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
 
-# Pre-fetch git dep source so cargo can build
+# Install cuDNN for CUDA 12
+RUN apt-get update && apt-get install -y cudnn-cuda-12 && rm -rf /var/lib/apt/lists/*
+
+# Install Rust via rustup
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path && \
+    /root/.cargo/bin/rustup default stable && \
+    rm -rf /root/.cargo/registry/cache
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Tell the linker where to find CUDA libs
+ENV LIBRARY_PATH="/usr/local/cuda/lib64:${LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+
 COPY Cargo.toml ./
 COPY Cargo.lock ./
 COPY src/ ./src/
-RUN cargo build --release --features cuda
+COPY config.toml /root/.cargo/config.toml
 
-FROM nvidia/cuda:12.4-runtime-bookworm
+RUN GIT_SSL_NO_VERIFY=1 CARGO_HTTP_SSL_VERIFY=false cargo fetch
+
+COPY ocr-rs-MNN/ /root/.cargo/git/checkouts/rust-paddle-ocr-a5cec83695220861/7368dfa/3rd_party/MNN/
+
+RUN GIT_SSL_NO_VERIFY=1 CARGO_HTTP_SSL_VERIFY=false cargo build --release --features cuda
+
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 RUN apt-get update && apt-get install -y libgomp1 libatomic1 && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
 COPY --from=builder /app/target/release/ocr-api /usr/local/bin/ocr-api
 COPY models/ /app/models/
 EXPOSE 8080
