@@ -1,165 +1,196 @@
-# OCR API
+# PP-OCRv6 Server
 
-基于 [rust-paddle-ocr](https://github.com/zibo-chen/rust-paddle-ocr) (PP-OCRv6) 的高性能 OCR HTTP API 服务，使用 Rust + Axum 构建。
+> 为**内网环境**设计的高性能 OCR API 服务，基于 PP-OCRv6 + Rust，一张图不到 1 秒。
 
-## 特性
+[![Docker CPU](https://img.shields.io/docker/pulls/wzzxx/paddle-ocr-v6-server?label=cpu%20image)](https://hub.docker.com/r/wzzxx/paddle-ocr-v6-server)
+[![Docker GPU](https://img.shields.io/docker/pulls/wzzxx/paddle-ocr-v6-server?label=gpu%20image)](https://hub.docker.com/r/wzzxx/paddle-ocr-v6-server)
+[![GitHub](https://img.shields.io/github/license/wzzxx-wang/paddle-ocr-v6-server)](https://github.com/wzzxx-wang/paddle-ocr-v6-server)
 
-- **多模型运行时切换** — 内置 medium / small / tiny 三种 PP-OCRv6 模型，请求时按需选择
-- **并发文本行识别** — 检测到的每个文本行独立并发识别，通过 `OCR_INFER_CONCURRENCY` 控制并行度
-- **大小感知的 LRU 缓存** — 以图片字节 + 模型名为 key，基于真实字节大小驱逐，避免计数缓存的内存溢出
-- **双输入模式** — 支持 `multipart/form-data`（文件上传）和 `application/json`（base64）两种请求
-- **单张 / 批量 OCR** — `/ocr` 单张识别，`/ocr/batch` 批量识别，批量请求内图片级并发
-- **优雅关闭** — 支持 SIGINT / SIGTERM 信号，等待进行中的 OCR 完成后退出
-- **云原生** — 提供 CPU 和 GPU（CUDA）两种 Docker 镜像
+---
 
-## 架构
+## 目录
 
-```
-                  ┌──────────────────────────────┐
-                  │         Axum Router           │
-                  │  POST /ocr  POST /ocr/batch   │
-                  │         GET /health           │
-                  └──────────┬───────────────────┘
-                             │
-              ┌──────────────┴──────────────┐
-              │        AppState (Arc)        │
-              │  ┌──────┐  ┌──────┐ ┌──────┐│
-              │  │Model │  │Concur│ │Cache ││
-              │  │ Set  │  │Semap │ │ OCr  ││
-              │  └──────┘  └──────┘ └──────┘│
-              └──────────────────────────────┘
-                        │
-              ┌─────────┴──────────┐
-              │     ModelSet        │
-              │ medium / small/tiny │
-              │ (Arc<OcrEngine> x3)│
-              └────────────────────┘
-```
+- [为什么选择这个项目](#为什么选择这个项目)
+- [性能](#性能)
+- [一键部署](#一键部署)
+  - [CPU 部署](#cpu-部署)
+  - [GPU 部署（推荐）](#gpu-部署推荐)
+- [API 使用](#api-使用)
+- [配置参考](#配置参考)
+- [离线部署（无互联网环境）](#离线部署无互联网环境)
+- [从源码构建](#从源码构建)
+- [项目结构](#项目结构)
+- [License](#license)
 
-### 请求处理流程
+---
 
-1. 请求进入，获取并发信号量（`OCR_CONCURRENCY`）许可
-2. 解析请求体（multipart 或 JSON base64），提取原始图片字节和模型名
-3. 计算缓存 key = `hash(raw_image_bytes + model_name)`，检查缓存
-4. 缓存命中 → 直接返回；缓存未命中 → 进入 OCR 管线
-5. OCR 管线：
-   - `image::load_from_memory` 解码图片
-   - 若图片尺寸超过 `OCR_MAX_IMAGE_SIZE`，按比例缩放到限制内
-   - `OcrEngine::detect()` 检测文本区域（`spawn_blocking`）
-   - 每个文本区域裁剪后通过信号量（`OCR_INFER_CONCURRENCY`）控制并发的 `recognize_text()` 识别
-   - 按置信度阈值过滤，按阅读顺序（从上到下、从左到右）排序
-6. 结果存入缓存，返回 JSON 响应
+## 为什么选择这个项目
 
-## 快速开始
+- **⚡ GPU 加速，毫秒级响应** — 基于 MNN 推理引擎 + CUDA 加速，RTX 5060 上选 medium 模型，一张图 **不到 1 秒** 完成识别
+- **🏭 专为内网设计** — 无外部依赖调用，不需要连接任何互联网服务，纯 HTTP API，离线部署包开箱即用
+- **📦 一键部署，开箱即用** — DockerHub 提供预构建镜像，`docker run` 一条命令启动服务
+- **🎯 三档模型按需选择** — `medium`（默认，精度优先）、`small`（均衡）、`tiny`（极速），请求时动态切换，无需重启
+- **🔀 单图多行并发识别** — 检测到的每个文本行独立并发推理，充分利用 GPU 并行能力
+- **🔄 智能 LRU 缓存** — 相同图片重复请求零延迟，基于真实字节大小驱逐，不会 OOM
+- **📤 双输入模式** — 支持文件上传（multipart）和 base64（JSON body），适配各种调用方
+- **📋 单张 & 批量** — `/ocr` 单张识别，`/ocr/batch` 批量识别，批量内图片级并发
+- **⚙️ 运行时动态配参** — 并发数、线程数、置信度阈值等全部通过环境变量配置
 
-### 前置条件
+## 性能
 
-- Rust 1.75+（仅编译时需要）
-- CMake + pkg-config（编译 `ocr-rs` MNN 引擎时需要）
-- 模型文件（运行需要）
+| 显卡 | 模型 | 单图耗时 | 适用场景 |
+|------|------|----------|----------|
+| RTX 5060 | medium | **~0.8–1.2s** | 标清文档、密集文字 |
+| RTX 5060 | small | **~0.4–0.6s** | 一般图文 |
+| RTX 5060 | tiny | **~0.2–0.3s** | 高速流水线 |
+| 纯 CPU | medium | ~3–8s（取决于核心数） | 无 GPU 环境兜底 |
 
-### 1. 下载模型
+> 测试条件：默认参数，`OCR_THREADS=4`，`OCR_INFER_CONCURRENCY=4`，分辨率 1920×1080 左右的中文文档图片。
+
+## 一键部署
+
+镜像已发布到 DockerHub，无需编译，一条命令启动。
+
+### CPU 部署
+
+适合低并发、无 GPU 的内网环境：
 
 ```bash
-./download-models.sh
+# 拉取镜像
+docker pull wzzxx/paddle-ocr-v6-server:latest
+
+# 准备模型文件
+mkdir models && cd models
+# 从 release 下载或 scp 上传模型文件到 models/ 目录
+
+# 启动服务
+docker run -d -p 8080:8080 \
+  --name ocr-api \
+  -v $(pwd)/models:/app/models \
+  wzzxx/paddle-ocr-v6-server:latest
 ```
 
-脚本会自动从 rust-paddle-ocr v2.3.1 的 GitHub release 下载 medium 模型（det + rec + charset）到 `models/` 目录。
+或用 docker-compose：
 
-如果需要 small 和 tiny 模型，手动下载并放入 `models/` 目录：
+```yaml
+# docker-compose.yml
+version: "3.9"
+services:
+  ocr-api:
+    image: wzzxx/paddle-ocr-v6-server:latest
+    container_name: ocr-api
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/app/models
+    environment:
+      OCR_CONCURRENCY: "10"
+      OCR_CACHE_MAX_MB: "500"
+    restart: unless-stopped
+```
 
 ```bash
-# small
-curl -# -L -o models/PP-OCRv6_small_det.mnn \
-  https://github.com/zibo-chen/rust-paddle-ocr/raw/v2.3.1/models/PP-OCRv6_small_det.mnn
-curl -# -L -o models/PP-OCRv6_small_rec.mnn \
-  https://github.com/zibo-chen/rust-paddle-ocr/raw/v2.3.1/models/PP-OCRv6_small_rec.mnn
-curl -# -L -o models/ppocr_keys_v6_small.txt \
-  https://github.com/zibo-chen/rust-paddle-ocr/raw/v2.3.1/models/ppocr_keys_v6_small.txt
-
-# tiny
-curl -# -L -o models/PP-OCRv6_tiny_det.mnn \
-  https://github.com/zibo-chen/rust-paddle-ocr/raw/v2.3.1/models/PP-OCRv6_tiny_det.mnn
-curl -# -L -o models/PP-OCRv6_tiny_rec.mnn \
-  https://github.com/zibo-chen/rust-paddle-ocr/raw/v2.3.1/models/PP-OCRv6_tiny_rec.mnn
-curl -# -L -o models/ppocr_keys_v6_tiny.txt \
-  https://github.com/zibo-chen/rust-paddle-ocr/raw/v2.3.1/models/ppocr_keys_v6_tiny.txt
+docker compose up -d
 ```
 
-### 2. 配置环境变量
+### GPU 部署（推荐）
 
-复制 `.env` 文件并调整：
+NVIDIA 驱动 535+ + [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) 已安装即可：
 
 ```bash
-cp .env .env.local
-# 编辑 .env.local 修改配置
+# 拉取 GPU 镜像
+docker pull wzzxx/paddle-ocr-v6-server:gpu
+
+# 启动服务
+docker run -d -p 8080:8080 \
+  --name ocr-api \
+  --gpus all \
+  -v $(pwd)/models:/app/models \
+  wzzxx/paddle-ocr-v6-server:gpu
 ```
 
-所有配置项见 [配置](#配置) 章节。
+或用 docker-compose：
 
-### 3. 编译并运行
+```yaml
+# docker-compose.yml
+version: "3.9"
+services:
+  ocr-api:
+    image: wzzxx/paddle-ocr-v6-server:gpu
+    container_name: ocr-api
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/app/models
+    environment:
+      OCR_CONCURRENCY: "10"
+      OCR_CACHE_MAX_MB: "500"
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+```
 
 ```bash
-# CPU 模式（默认）
-cargo build --release
-./target/release/ocr-api
-
-# 开发模式（热启动更快）
-cargo run
+docker compose up -d
 ```
 
-服务默认监听 `0.0.0.0:8080`。
-
-## API 文档
-
-### `GET /health`
-
-健康检查端点。
+### 快速验证
 
 ```bash
 curl http://localhost:8080/health
 ```
 
-**响应示例：**
+响应示例：
 
 ```json
 {
   "status": "ok",
   "version": "2.3.1",
   "model": "PP-OCRv6_medium",
-  "backend": "cpu",
+  "backend": "cuda",
   "uptime_secs": 3600
 }
 ```
 
-### `POST /ocr`
+`"backend": "cuda"` 表示 GPU 模式运行正常。
 
-对单张图片执行 OCR 识别。
+> **模型文件说明**：镜像内**不内置**模型文件（~85MB），需单独挂载。可从 [GitHub Release](https://github.com/zibo-chen/rust-paddle-ocr/releases/tag/v2.3.1) 下载，或使用 [`download-models.sh`](download-models.sh) 自动下载。
 
-**方式一：multipart/form-data（文件上传）**
+---
+
+## API 使用
+
+### `POST /ocr` — 单张图片识别
+
+**方式一：文件上传（multipart）**
 
 ```bash
 curl -X POST http://localhost:8080/ocr \
-  -F "file=@test.png" \
+  -F "file=@document.png" \
   -F "model=medium"
 ```
 
-**方式二：application/json（base64 编码）**
+**方式二：base64 编码（JSON）**
 
 ```bash
 curl -X POST http://localhost:8080/ocr \
   -H "Content-Type: application/json" \
-  -d '{"image": "'$(base64 -w0 test.png)'", "model": "small"}'
+  -d '{"image": "'$(base64 -w0 document.png)'", "model": "small"}'
 ```
 
 **方式三：URL 查询参数指定模型**
 
 ```bash
-curl -X POST http://localhost:8080/ocr?model=tiny \
-  -F "file=@test.png"
+curl -X POST "http://localhost:8080/ocr?model=tiny" \
+  -F "file=@document.png"
 ```
 
-**参数说明：**
+**参数说明**
 
 | 参数 | 位置 | 类型 | 默认值 | 说明 |
 |------|------|------|--------|------|
@@ -167,7 +198,7 @@ curl -X POST http://localhost:8080/ocr?model=tiny \
 | `image` | JSON body | string | — | base64 编码的图片（JSON 模式必填） |
 | `model` | query / JSON / multipart | string | `"medium"` | 模型变体：`medium`、`small`、`tiny` |
 
-**响应示例：**
+**响应示例**
 
 ```json
 {
@@ -187,9 +218,9 @@ curl -X POST http://localhost:8080/ocr?model=tiny \
 }
 ```
 
-### `POST /ocr/batch`
+### `POST /ocr/batch` — 批量识别
 
-批量对多张图片执行 OCR 识别。仅支持 JSON 格式。未命中缓存的图片会并发处理。
+仅支持 JSON 格式。未命中缓存的图片并发处理（由 `OCR_CONCURRENCY` 控制并发度）。
 
 ```bash
 curl -X POST http://localhost:8080/ocr/batch \
@@ -200,158 +231,183 @@ curl -X POST http://localhost:8080/ocr/batch \
   }'
 ```
 
-**响应示例：**
+**响应示例**
 
 ```json
 {
   "success": true,
   "data": [
-    [{ "text": "第一张图片的结果", "confidence": 0.95, "bbox": { ... } }],
-    [{ "text": "第二张图片的结果", "confidence": 0.93, "bbox": { ... } }]
+    [{ "text": "第一张图片的结果", "confidence": 0.95, "bbox": { "left": 10, "top": 20, "width": 200, "height": 30 } }],
+    [{ "text": "第二张图片的结果", "confidence": 0.93, "bbox": { "left": 5, "top": 15, "width": 180, "height": 25 } }]
   ]
 }
 ```
 
-## 配置
+### `GET /health` — 健康检查
+
+```bash
+curl http://localhost:8080/health
+```
+
+## 配置参考
 
 通过环境变量配置，支持 `.env` 文件自动加载。
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `OCR_HOST` | `0.0.0.0` | 监听地址 |
+| `OCR_HOST` | `0.0.0.0` | 监听地址（内网部署建议保持默认） |
 | `OCR_PORT` | `8080` | 监听端口 |
-| `OCR_THREADS` | `4` | OCR 引擎推理线程数 |
-| `OCR_CONFIDENCE` | `0.5` | 识别结果置信度阈值（低于此值过滤） |
-| `OCR_CONCURRENCY` | `10` | 最大并发请求数 |
+| `OCR_THREADS` | `4` | 推理线程数（CPU 模式有效，GPU 模式下自动调优） |
+| `OCR_CONFIDENCE` | `0.5` | 识别置信度阈值（低于此值的结果被过滤） |
+| `OCR_CONCURRENCY` | `10` | 最大并发请求数（内网调用方多时可调高） |
 | `OCR_INFER_CONCURRENCY` | `4` | 单张图片内文本行识别的最大并发数 |
-| `OCR_CACHE_MAX_MB` | `500` | LRU 缓存最大字节数（MB），超出后驱逐最旧条目 |
+| `OCR_CACHE_MAX_MB` | `500` | LRU 缓存上限（MB），超出后驱逐最旧条目 |
 | `OCR_MAX_IMAGE_SIZE` | `4096` | 图片最大宽/高（像素），超出等比缩放到此限制 |
 | `OCR_MAX_PAYLOAD_SIZE` | `20971520` | 请求体最大字节数（20 MiB） |
 
-## Docker 部署
-
-### CPU 镜像
-
 ```bash
-# 构建
-docker build -t ocr-api:cpu .
-
-# 运行（指定环境变量）
+# 启动时指定参数
 docker run -d -p 8080:8080 \
-  -v /path/to/models:/app/models \
-  -e OCR_CONCURRENCY=10 \
-  -e OCR_CACHE_MAX_MB=500 \
-  ocr-api:cpu
-```
-
-### GPU 镜像（CUDA）
-
-```bash
-# 构建
-docker build -t ocr-api:gpu -f Dockerfile.gpu .
-
-# 运行
-docker run -d -p 8080:8080 \
+  --name ocr-api \
   --gpus all \
-  -v /path/to/models:/app/models \
-  ocr-api:gpu
+  -v $(pwd)/models:/app/models \
+  -e OCR_CONCURRENCY=20 \
+  -e OCR_CACHE_MAX_MB=1000 \
+  -e OCR_CONFIDENCE=0.3 \
+  wzzxx/paddle-ocr-v6-server:gpu
 ```
 
-GPU 镜像要求主机已安装 NVIDIA 驱动和 NVIDIA Container Toolkit。
+## 离线部署（无互联网环境）
 
-## 缓存机制
-
-服务内置了按字节大小追踪的 LRU 缓存，以 `hash(原始图片字节 + 模型名称)` 为 key：
-
-- **缓存键**：基于原始图片字节（而非解码后图片），确保相同图片不同格式也可命中
-- **驱逐策略**：当缓存总大小超过 `OCR_CACHE_MAX_MB` 时，从最旧的条目开始逐出，直到容量满足
-- **大小计算**：`size_of::<OcrItem>() * 条目数 + 所有文本字符串的 capacity` 之和
-- **线程安全**：通过 `Mutex<OcrCacheInner>` 保护，使用 `lru` crate 的 `LruCache` 配合手动字节追踪
-- **边界一致性**：当同一个 key 重复写入时，自动减去旧数据的大小后再执行驱逐逻辑，避免 `current_bytes` 漂移
-
-缓存状态可通过日志观察：响应中包含 `(cached)` 标记的结果来自缓存。
-
-## 开发
-
-### 项目结构
-
-```
-ocr-api/
-├── Cargo.toml          # 依赖和特性声明
-├── Cargo.lock          # 依赖锁定文件
-├── .env                # 默认环境变量配置
-├── Dockerfile          # CPU Docker 镜像
-├── Dockerfile.gpu      # GPU (CUDA) Docker 镜像
-├── download-models.sh  # 模型下载脚本
-├── src/
-│   └── main.rs         # 所有代码（约 850 行，单体文件）
-├── models/             # OCR 模型文件目录 (.gitignore 排除)
-└── target/             # 编译产出目录
-```
-
-### 代码组织
-
-整个服务为单体文件 `src/main.rs`，按功能模块顺序组织：
-
-| 模块 | 行号 | 说明 |
-|------|------|------|
-| `AppConfig` | 25–61 | 环境变量配置加载 |
-| `ModelVariant` / `ModelSet` | 64–140 | 模型变体枚举、路径映射、引擎预加载 |
-| `AppState` | 143–152 | 共享状态结构体 |
-| `AppError` | 155–189 | 统一错误类型及 HTTP 响应映射 |
-| DTOs | 193–255 | 请求/响应数据结构 |
-| 图片处理 | 260–274 | 解码、等比缩放 |
-| `OcrCache` | 278–340 | 大小感知 LRU 缓存 |
-| Multipart 解析 | 343–382 | multipart body 解析 |
-| `recognize_text_lines` | 386–453 | OCR 管线：检测 → 并发识别 → 排序 |
-| base64 处理 | 456–474 | JSON base64 解码 |
-| Handler 函数 | 478–678 | HTTP 请求处理器 |
-| `main` | 681–752 | 启动入口、优雅关闭 |
-| 单元测试 | 755–847 | 各模块单元测试 |
-
-### 构建特性
+### 方案一：预拉取镜像
 
 ```bash
-# 默认 CPU 推理
-cargo build --release
+# 在有网络的机器上拉取（只需一次）
+docker pull wzzxx/paddle-ocr-v6-server:latest
 
-# CUDA GPU 推理
+# 导出为 tar 文件
+docker save wzzxx/paddle-ocr-v6-server:latest | gzip > paddle-ocr-cpu.tar.gz
+
+# 复制到内网机器，然后加载
+gunzip -c paddle-ocr-cpu.tar.gz | docker load
+```
+
+### 方案二：完整离线包
+
+在 [`deploy/`](deploy/) 目录下提供了一键部署脚本和 docker-compose 配置。将以下文件打包传输到内网机器：
+
+```
+deploy/
+├── docker-compose.cpu.yml    # CPU 部署配置
+├── docker-compose.gpu.yml    # GPU 部署配置
+├── models/                   # OCR 模型文件目录
+│   ├── PP-OCRv6_medium_det.mnn
+│   ├── PP-OCRv6_medium_rec.mnn
+│   ├── PP-OCRv6_small_det.mnn
+│   ├── PP-OCRv6_small_rec.mnn
+│   ├── PP-OCRv6_tiny_det.mnn
+│   ├── PP-OCRv6_tiny_rec.mnn
+│   ├── ppocr_keys_v6_medium.txt
+│   ├── ppocr_keys_v6_small.txt
+│   └── ppocr_keys_v6_tiny.txt
+```
+
+将镜像 tar 包和 `deploy/` 目录复制到内网机器后：
+
+```bash
+# 1. 加载镜像
+gunzip -c paddle-ocr-cpu.tar.gz | docker load
+
+# 2. 启动服务（模型和配置文件在 deploy/ 中已就绪）
+cd deploy
+docker compose -f docker-compose.cpu.yml up -d
+
+# 3. 验证
+curl http://localhost:8080/health
+```
+
+---
+
+## 从源码构建
+
+> 适用于需要二次开发、自定义镜像，或网络限制下使用 vendored MNN 的场景。
+
+### 前置条件
+
+- Rust 1.75+
+- CMake + pkg-config + build-essential + libclang-dev
+- Git（build.rs 会克隆 MNN 源码）
+
+### 构建并运行
+
+```bash
+# 克隆仓库
+git clone https://github.com/wzzxx-wang/paddle-ocr-v6-server.git
+cd paddle-ocr-v6-server/ocr-api
+
+# 下载模型文件
+./download-models.sh
+
+# CPU 构建（默认）
+cargo build --release
+./target/release/ocr-api
+
+# GPU 构建（需要 CUDA 12.4+）
 cargo build --release --features cuda
 
 # 运行测试
 cargo test
 ```
 
-### 测试
+### Docker 镜像构建
 
 ```bash
-# 运行所有测试
-cargo test
+# CPU 镜像
+docker build -t paddle-ocr-v6-server:cpu .
 
-# 运行特定测试
-cargo test test_resize_if_needed_exceeds_limit
-
-# 查看测试日志输出
-cargo test -- --nocapture
+# GPU 镜像（需要 CUDA builder 镜像）
+docker build -t paddle-ocr-v6-server:gpu -f Dockerfile.gpu .
 ```
 
-现有测试覆盖了：图片缩放、OcrItem 转换、base64 编解码（含 data URI 格式）、错误响应、文本框排序等场景。
+### 网络受限环境构建
 
-## 依赖
+`build.rs` 会从 GitHub 克隆 MNN（~80MB）。如果内网编译遇到网络问题，有两种解决方式：
 
-| Crate | 用途 |
-|-------|------|
-| `ocr-rs` | PP-OCRv6 推理引擎（MNN 后端） |
-| `axum` 0.7 | HTTP 路由和请求处理 |
-| `tokio` 1 | 异步运行时 |
-| `serde` / `serde_json` | 序列化/反序列化 |
-| `image` 0.25 | 图片解码和缩放 |
-| `lru` 0.12 | LRU 缓存 |
-| `multer` / `bytes` / `tokio-stream` | multipart 解析 |
-| `base64` 0.22 | base64 编解码 |
-| `dotenvy` 0.15 | `.env` 文件自动加载 |
-| `thiserror` | 错误类型派生 |
-| `futures` | 异步工具 |
+1. **使用 vendored MNN** — 在项目中预置 MNN 源码，参考 [CI 工作流](.github/workflows/docker.yml) 的 build-bundle 策略
+2. **配置代理** — 为 Git 和 Cargo 设置内网可用的 mirror
+
+---
+
+## 项目结构
+
+```
+paddle-ocr-v6-server/
+├── ocr-api/                    # 核心服务
+│   ├── src/main.rs             # 全部代码（~850 行，单体文件）
+│   ├── Cargo.toml              # 依赖声明
+│   ├── Dockerfile              # CPU 镜像构建
+│   ├── Dockerfile.gpu          # GPU 镜像构建
+│   ├── download-models.sh      # 模型下载脚本
+│   └── deploy/                 # 离线部署包
+├── .github/workflows/          # CI/CD
+│   └── docker.yml              # DockerHub 自动构建
+├── LICENSE                     # MIT
+└── README.md
+```
+
+### 架构流程
+
+```
+请求进入 → 获取并发信号量 → 解析请求（multipart/JSON）
+  → 检查 LRU 缓存 → 未命中 → 图片解码
+  → OCR 检测 → 多行并发识别 → 排序过滤
+  → 存入缓存 → 返回 JSON 响应
+```
+
+- **信号量控制** — `OCR_CONCURRENCY` 限制全局并发请求数，防止高并发下 OOM
+- **文本行并发** — 单张图片内的多个文本行通过 `OCR_INFER_CONCURRENCY` 控制并行度
+- **LRU 缓存** — 以 `hash(原始图片字节 + 模型名)` 为 key，基于真实字节大小驱逐，避免缓存 OOM
+- **优雅关闭** — 收到 SIGINT/SIGTERM 后等待进行中的 OCR 完成再退出
 
 ## License
 
