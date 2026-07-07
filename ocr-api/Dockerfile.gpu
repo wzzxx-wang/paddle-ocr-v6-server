@@ -18,16 +18,10 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 ENV LIBRARY_PATH="/usr/local/cuda/lib64:${LIBRARY_PATH}"
 ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
 
-COPY Cargo.toml ./
-COPY Cargo.lock ./
+COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
-COPY config.toml /root/.cargo/config.toml
 
-RUN GIT_SSL_NO_VERIFY=1 CARGO_HTTP_SSL_VERIFY=false cargo fetch
-
-COPY ocr-rs-MNN/ /root/.cargo/git/checkouts/rust-paddle-ocr-a5cec83695220861/7368dfa/3rd_party/MNN/
-
-RUN GIT_SSL_NO_VERIFY=1 CARGO_HTTP_SSL_VERIFY=false cargo build --release --features cuda
+RUN cargo build --release --features cuda
 
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 RUN apt-get update && apt-get install -y libgomp1 libatomic1 && rm -rf /var/lib/apt/lists/*

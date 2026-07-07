@@ -7,4 +7,6 @@ deploy/
 test-image.png
 .env
 .env.local
+ocr-rs-MNN/
+config.toml
 Dockerfile*
