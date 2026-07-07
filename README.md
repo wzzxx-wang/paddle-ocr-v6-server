@@ -1,40 +1,48 @@
 # PP-OCRv6 Server
 
-基于 [rust-paddle-ocr](https://github.com/zibo-chen/rust-paddle-ocr) (PP-OCRv6) 的高性能 OCR HTTP API 服务，使用 Rust + Axum 构建。
+> 为 **内网环境** 设计的高性能 OCR API 服务，基于 PP-OCRv6 + Rust + MNN。
 
-核心代码在 [`ocr-api/`](ocr-api/) 目录下。
+[![GitHub](https://img.shields.io/github/license/wzzxx-wang/paddle-ocr-v6-server)](https://github.com/wzzxx-wang/paddle-ocr-v6-server)
+[![Docker](https://img.shields.io/badge/docker-pull-blue?logo=docker)](https://hub.docker.com/r/wzzxx/paddle-ocr-v6-server)
 
-## 特性
+GPU 加速 — NVIDIA RTX 5060 选 medium 模型，**一张图不到 1 秒**完成识别。
 
-- **多模型运行时切换** — medium / small / tiny 三种 PP-OCRv6 模型
-- **并发文本行识别** — 单图内检测到的文本行并发推理
-- **大小感知的 LRU 缓存** — 基于字节大小驱逐，避免 OOM
-- **双输入模式** — multipart 文件上传 和 JSON base64
-- **单张 / 批量 OCR**
-- **CPU / GPU（CUDA）** 双 Docker 镜像
+提供预构建 Docker 镜像，一条命令启动服务，纯 HTTP API 接口，专为内网离线环境设计。
 
-## 快速开始
+---
 
-```bash
-cd ocr-api
-# 下载模型
-./download-models.sh
+## 亮点
 
-# 编译运行
-cargo run --release
-```
+- **⚡ GPU 加速** — MNN + CUDA，5060 上 1 秒识别一张标清文档图
+- **📦 一键部署** — `docker run` 即启，无需编译、无需连接外网
+- **🎯 三档模型** — `medium`（精度优先）/ `small`（均衡）/ `tiny`（极速），请求时动态切换
+- **🔀 文本行并发** — 检测到的多个文本行独立并行推理，充分利用 GPU
+- **🔄 LRU 缓存** — 相同图片重复请求零延迟，按真实字节大小驱逐
+- **📤 双输入** — 文件上传（multipart）或 base64（JSON）均支持
+- **📋 批量识别** — 单次请求提交多张图，图片级并发处理
 
-更多详情见 [`ocr-api/README.md`](ocr-api/README.md)。
-
-## Docker
+## 一键部署
 
 ```bash
 # CPU
-docker build -t paddle-ocr-v6-server:cpu ocr-api/
+docker run -d -p 8080:8080 -v $(pwd)/models:/app/models \
+  wzzxx/paddle-ocr-v6-server:latest
 
-# GPU (CUDA)
-docker build -t paddle-ocr-v6-server:gpu -f ocr-api/Dockerfile.gpu ocr-api/
+# GPU（推荐）
+docker run -d -p 8080:8080 --gpus all -v $(pwd)/models:/app/models \
+  wzzxx/paddle-ocr-v6-server:gpu
+
+# 验证
+curl http://localhost:8080/health
 ```
+
+## 快速链接
+
+- [完整文档 →](ocr-api/README.md)
+- [API 使用](ocr-api/README.md#post-ocr--单张图片识别)
+- [配置参考](ocr-api/README.md#配置参考)
+- [离线部署指南](ocr-api/README.md#离线部署无互联网环境)
+- [GitHub 仓库](https://github.com/wzzxx-wang/paddle-ocr-v6-server)
 
 ## License
 
